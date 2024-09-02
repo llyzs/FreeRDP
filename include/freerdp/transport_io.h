@@ -23,6 +23,7 @@
 #define FREERDP_TRANSPORT_IO_H
 
 #include <winpr/stream.h>
+#include <winpr/sspi.h>
 
 #include <freerdp/api.h>
 #include <freerdp/types.h>
@@ -33,6 +34,19 @@ extern "C"
 {
 #endif
 
+	typedef int (*pTransportTunnelRead)(void* arg, BYTE* data, int size);
+	typedef int (*pTransportTunnelWrite)(void* arg, const BYTE* data, int size);
+
+	struct rdp_transport_tunnel_io
+	{
+		rdpTransport* transport;
+		void* arg;
+		pTransportTunnelRead tunnelRead;
+		pTransportTunnelWrite tunnelWrite;
+		UINT64 reserved[60]; /* Reserve some space for ABI compatibility */
+	};
+	typedef struct rdp_transport_tunnel_io rdpTransportTunnelIo;
+
 	typedef int (*pTCPConnect)(rdpContext* context, rdpSettings* settings, const char* hostname,
 	                           int port, DWORD timeout);
 	typedef BOOL (*pTransportFkt)(rdpTransport* transport);
@@ -42,6 +56,9 @@ extern "C"
 	typedef BOOL (*pTransportGetPublicKey)(rdpTransport* transport, const BYTE** data,
 	                                       DWORD* length);
 	typedef BOOL (*pTransportSetBlockingMode)(rdpTransport* transport, BOOL blocking);
+	typedef BOOL (*pTransportSetTimeout)(rdpTransport* transport, DWORD timeout);
+	typedef const SecPkgContext_Bindings* (*pTransportGetChannelBindings)(rdpTransport* transport);
+	typedef BOOL (*pTransportTunnel)(rdpTransport* transport, rdpTransportTunnelIo* tunnelIo);
 
 	struct rdp_transport_io
 	{
@@ -55,7 +72,10 @@ extern "C"
 		pTransportRead ReadBytes; /* Reads up to a requested amount of bytes from the transport */
 		pTransportGetPublicKey GetPublicKey;
 		pTransportSetBlockingMode SetBlockingMode;
-		UINT64 reserved[54]; /* Reserve some space for ABI compatibility */
+		pTransportSetTimeout SetTimeout;
+		pTransportGetChannelBindings GetChannelBindings;
+		pTransportTunnel Tunnel;
+		UINT64 reserved[51]; /* Reserve some space for ABI compatibility */
 	};
 	typedef struct rdp_transport_io rdpTransportIo;
 
@@ -77,6 +97,9 @@ extern "C"
 	FREERDP_API SSIZE_T transport_parse_pdu(rdpTransport* transport, wStream* s, BOOL* incomplete);
 	FREERDP_API rdpContext* transport_get_context(rdpTransport* transport);
 	FREERDP_API rdpTransport* freerdp_get_transport(rdpContext* context);
+
+	FREERDP_API BOOL transport_set_user_context(rdpTransport* transport, void* usercontext);
+	FREERDP_API void* transport_get_user_context(rdpTransport* transport);
 
 #ifdef __cplusplus
 }

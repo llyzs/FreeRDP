@@ -59,7 +59,7 @@ struct rdp_credssp_auth
 	SEC_WINPR_KERBEROS_SETTINGS kerberosSettings;
 	CredHandle credentials;
 	BOOL server;
-	SecPkgContext_Bindings* bindings;
+	const SecPkgContext_Bindings* bindings;
 	TCHAR* spn;
 	WCHAR* package_list;
 	CtxtHandle context;
@@ -117,7 +117,7 @@ rdpCredsspAuth* credssp_auth_new(const rdpContext* rdp_ctx)
 	return auth;
 }
 
-BOOL credssp_auth_init(rdpCredsspAuth* auth, TCHAR* pkg_name, SecPkgContext_Bindings* bindings)
+BOOL credssp_auth_init(rdpCredsspAuth* auth, TCHAR* pkg_name, const SecPkgContext_Bindings* bindings)
 {
 	WINPR_ASSERT(auth);
 	WINPR_ASSERT(auth->rdp_ctx);

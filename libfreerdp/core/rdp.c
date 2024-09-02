@@ -2430,15 +2430,9 @@ BOOL rdp_reset(rdpRdp* rdp)
 		goto fail;
 
 	rc = FALSE;
-	rdp->transport = transport_new(context);
+	rdp->transport = rdp_transport_new(rdp);
 	if (!rdp->transport)
 		goto fail;
-
-	if (rdp->io)
-	{
-		if (!transport_set_io_callbacks(rdp->transport, rdp->io))
-			goto fail;
-	}
 
 	aad_free(rdp->aad);
 	rdp->aad = aad_new(context, rdp->transport);
@@ -2546,6 +2540,25 @@ void* rdp_get_io_callback_context(rdpRdp* rdp)
 {
 	WINPR_ASSERT(rdp);
 	return rdp->ioContext;
+}
+
+rdpTransport* rdp_transport_new(rdpRdp* rdp)
+{
+	rdpTransport* transport = transport_new(rdp->context);
+	if (!transport)
+		goto fail;
+
+	if (rdp->io)
+	{
+		if (!transport_set_io_callbacks(transport, rdp->io))
+			goto fail;
+	}
+
+	return transport;
+
+fail:
+	transport_free(transport);
+	return NULL;
 }
 
 const char* rdp_finalize_flags_to_str(UINT32 flags, char* buffer, size_t size)

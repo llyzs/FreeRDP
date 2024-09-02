@@ -32,6 +32,7 @@
 
 #include <freerdp/log.h>
 #include <freerdp/error.h>
+#include <freerdp/transport_io.h>
 #include <freerdp/utils/ringbuffer.h>
 #include <freerdp/utils/smartcardlogon.h>
 
@@ -40,7 +41,7 @@
 #include "../credssp_auth.h"
 #include "../proxy.h"
 #include "../rdp.h"
-#include "../../crypto/opensslcompat.h"
+#include "../transport.h"
 #include "rpc_fault.h"
 #include "../utils.h"
 
@@ -117,10 +118,8 @@ typedef struct
 struct rdp_rdg
 {
 	rdpContext* context;
-	BOOL attached;
-	BIO* frontBio;
-	rdpTls* tlsIn;
-	rdpTls* tlsOut;
+	rdpTransport* transportIn;
+	rdpTransport* transportOut;
 	rdpCredsspAuth* auth;
 	HttpContext* http;
 	CRITICAL_SECTION writeSection;
@@ -137,6 +136,7 @@ struct rdp_rdg
 
 	SmartcardCertInfo* smartcard;
 	wLog* log;
+	rdpTransportTunnelIo tunnelIo;
 };
 
 enum
@@ -288,7 +288,7 @@ static BOOL rdg_read_http_unicode_string(wLog* log, wStream* s, const WCHAR** st
 	return TRUE;
 }
 
-static BOOL rdg_write_chunked(BIO* bio, wStream* sPacket)
+static BOOL rdg_write_chunked(rdpTransport* transport, wStream* sPacket)
 {
 	size_t len = 0;
 	int status = 0;
@@ -312,8 +312,7 @@ static BOOL rdg_write_chunked(BIO* bio, wStream* sPacket)
 		return FALSE;
 	}
 
-	ERR_clear_error();
-	status = BIO_write(bio, Stream_Buffer(sChunk), (int)len);
+	status = transport_write(transport, sChunk);
 	Stream_Free(sChunk, TRUE);
 
 	if (status != (SSIZE_T)len)
@@ -328,32 +327,38 @@ static BOOL rdg_write_packet(rdpRdg* rdg, wStream* sPacket)
 	{
 		if (rdg->transferEncoding.context.websocket.closeSent)
 			return FALSE;
-		return websocket_write_wstream(rdg->tlsOut->bio, sPacket, WebsocketBinaryOpcode);
+		return websocket_transport_write_wstream(rdg->transportOut, sPacket, WebsocketBinaryOpcode);
 	}
 
-	return rdg_write_chunked(rdg->tlsIn->bio, sPacket);
+	return rdg_write_chunked(rdg->transportIn, sPacket);
 }
 
-static int rdg_socket_read(BIO* bio, BYTE* pBuffer, size_t size,
+static int rdg_socket_read(rdpTransport* transport, BYTE* pBuffer, size_t size,
                            rdg_http_encoding_context* encodingContext)
 {
 	WINPR_ASSERT(encodingContext != NULL);
 
 	if (encodingContext->isWebsocketTransport)
 	{
-		return websocket_read(bio, pBuffer, size, &encodingContext->context.websocket);
+		return websocket_transport_read(transport, pBuffer, size,
+		                                &encodingContext->context.websocket);
 	}
 
+	int status;
 	switch (encodingContext->httpTransferEncoding)
 	{
 		case TransferEncodingIdentity:
-			ERR_clear_error();
-			return BIO_read(bio, pBuffer, size);
+			status = (int)transport_read_bytes(transport, pBuffer, size);
+			break;
 		case TransferEncodingChunked:
-			return http_chuncked_read(bio, pBuffer, size, &encodingContext->context.chunked);
+			status = http_transport_chuncked_read(transport, pBuffer, size,
+			                                      &encodingContext->context.chunked);
+			break;
 		default:
-			return -1;
+			status = -1;
+			break;
 	}
+	return status;
 }
 
 static BOOL rdg_shall_abort(rdpRdg* rdg)
@@ -362,7 +367,7 @@ static BOOL rdg_shall_abort(rdpRdg* rdg)
 	return freerdp_shall_disconnect_context(rdg->context);
 }
 
-static BOOL rdg_read_all(rdpContext* context, rdpTls* tls, BYTE* buffer, size_t size,
+static BOOL rdg_read_all(rdpContext* context, rdpTransport* transport, BYTE* buffer, size_t size,
                          rdg_http_encoding_context* transferEncoding)
 {
 	size_t readCount = 0;
@@ -373,15 +378,11 @@ static BOOL rdg_read_all(rdpContext* context, rdpTls* tls, BYTE* buffer, size_t 
 		if (freerdp_shall_disconnect_context(context))
 			return FALSE;
 
-		int status = rdg_socket_read(tls->bio, pBuffer, size - readCount, transferEncoding);
-		if (status <= 0)
-		{
-			if (!BIO_should_retry(tls->bio))
-				return FALSE;
-
-			Sleep(10);
+		int status = rdg_socket_read(transport, pBuffer, size - readCount, transferEncoding);
+		if (status == 0)
 			continue;
-		}
+		if (status < 0)
+			return FALSE;
 
 		readCount += status;
 		pBuffer += status;
@@ -399,7 +400,8 @@ static wStream* rdg_receive_packet(rdpRdg* rdg)
 	if (!s)
 		return NULL;
 
-	if (!rdg_read_all(rdg->context, rdg->tlsOut, Stream_Buffer(s), header, &rdg->transferEncoding))
+	if (!rdg_read_all(rdg->context, rdg->transportOut, Stream_Buffer(s), header,
+	                  &rdg->transferEncoding))
 	{
 		Stream_Free(s, TRUE);
 		return NULL;
@@ -415,7 +417,7 @@ static wStream* rdg_receive_packet(rdpRdg* rdg)
 		return NULL;
 	}
 
-	if (!rdg_read_all(rdg->context, rdg->tlsOut, Stream_Buffer(s) + header,
+	if (!rdg_read_all(rdg->context, rdg->transportOut, Stream_Buffer(s) + header,
 	                  (int)packetLength - (int)header, &rdg->transferEncoding))
 	{
 		Stream_Free(s, TRUE);
@@ -575,7 +577,7 @@ static BOOL rdg_send_tunnel_authorization(rdpRdg* rdg)
 
 	Stream_Write_UINT16(s, PKT_TYPE_TUNNEL_AUTH);                  /* Type (2 bytes) */
 	Stream_Write_UINT16(s, 0);                                     /* Reserved (2 bytes) */
-	Stream_Write_UINT32(s, packetSize);                            /* PacketLength (4 bytes) */
+	Stream_Write_UINT32(s, (UINT32)packetSize);                    /* PacketLength (4 bytes) */
 	Stream_Write_UINT16(s, 0);                                     /* FieldsPresent (2 bytes) */
 	Stream_Write_UINT16(s, (UINT16)clientNameLen * sizeof(WCHAR)); /* Client name string length */
 	Stream_Write_UTF16_String(s, clientName, (size_t)clientNameLen);
@@ -615,12 +617,12 @@ static BOOL rdg_send_channel_create(rdpRdg* rdg)
 
 	Stream_Write_UINT16(s, PKT_TYPE_CHANNEL_CREATE); /* Type (2 bytes) */
 	Stream_Write_UINT16(s, 0);                       /* Reserved (2 bytes) */
-	Stream_Write_UINT32(s, packetSize);              /* PacketLength (4 bytes) */
+	Stream_Write_UINT32(s, (UINT32)packetSize);      /* PacketLength (4 bytes) */
 	Stream_Write_UINT8(s, 1);                        /* Number of resources. (1 byte) */
 	Stream_Write_UINT8(s, 0);                        /* Number of alternative resources (1 byte) */
 	Stream_Write_UINT16(s,
 	                    (UINT16)rdg->context->settings->ServerPort); /* Resource port (2 bytes) */
-	Stream_Write_UINT16(s, 3);                                 /* Protocol number (2 bytes) */
+	Stream_Write_UINT16(s, 3);                                       /* Protocol number (2 bytes) */
 	Stream_Write_UINT16(s, (UINT16)serverNameLen * sizeof(WCHAR));
 	Stream_Write_UTF16_String(s, serverName, (size_t)serverNameLen);
 	Stream_SealLength(s);
@@ -740,7 +742,7 @@ static BOOL rdg_recv_auth_token(wLog* log, rdpCredsspAuth* auth, HttpResponse* r
 	if (authTokenLength && authTokenData)
 	{
 		authToken.pvBuffer = authTokenData;
-		authToken.cbBuffer = authTokenLength;
+		authToken.cbBuffer = (unsigned long)authTokenLength;
 		credssp_auth_take_input_buffer(auth, &authToken);
 	}
 	else
@@ -753,7 +755,8 @@ static BOOL rdg_recv_auth_token(wLog* log, rdpCredsspAuth* auth, HttpResponse* r
 	return TRUE;
 }
 
-static BOOL rdg_skip_seed_payload(rdpContext* context, rdpTls* tls, size_t lastResponseLength,
+static BOOL rdg_skip_seed_payload(rdpContext* context, rdpTransport* transport,
+                                  size_t lastResponseLength,
                                   rdg_http_encoding_context* transferEncoding)
 {
 	BYTE seed_payload[10] = { 0 };
@@ -764,7 +767,8 @@ static BOOL rdg_skip_seed_payload(rdpContext* context, rdpTls* tls, size_t lastR
 	 */
 	if (lastResponseLength < size)
 	{
-		if (!rdg_read_all(context, tls, seed_payload, size - lastResponseLength, transferEncoding))
+		if (!rdg_read_all(context, transport, seed_payload, size - lastResponseLength,
+		                  transferEncoding))
 		{
 			return FALSE;
 		}
@@ -1127,29 +1131,37 @@ DWORD rdg_get_event_handles(rdpRdg* rdg, HANDLE* events, DWORD count)
 	DWORD nCount = 0;
 	WINPR_ASSERT(rdg != NULL);
 
-	if (rdg->tlsOut && rdg->tlsOut->bio)
-	{
-		if (events && (nCount < count))
-		{
-			BIO_get_event(rdg->tlsOut->bio, &events[nCount]);
-			nCount++;
-		}
-		else
-			return 0;
-	}
-
-	if (!rdg->transferEncoding.isWebsocketTransport && rdg->tlsIn && rdg->tlsIn->bio)
-	{
-		if (events && (nCount < count))
-		{
-			BIO_get_event(rdg->tlsIn->bio, &events[nCount]);
-			nCount++;
-		}
-		else
-			return 0;
-	}
+	/* Event handles are only used for polling, so it is safe to use the outgoing FD only */
+	if (rdg->transportOut)
+		nCount += transport_get_event_handles(rdg->transportOut, &events[nCount], count - nCount);
 
 	return nCount;
+}
+
+BOOL rdg_set_blocking_mode(rdpRdg* rdg, BOOL blocking)
+{
+	WINPR_ASSERT(rdg != NULL);
+
+	if (rdg->transportOut)
+	{
+		if (!transport_set_blocking_mode(rdg->transportOut, blocking))
+			return FALSE;
+	}
+
+	if (!rdg->transferEncoding.isWebsocketTransport && rdg->transportIn)
+	{
+		if (!transport_set_blocking_mode(rdg->transportIn, blocking))
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+rdpTransportTunnelIo* rdg_get_tunnel_io(rdpRdg* rdg)
+{
+	WINPR_ASSERT(rdg);
+
+	return &rdg->tunnelIo;
 }
 
 static BOOL rdg_get_gateway_credentials(rdpContext* context, rdp_auth_reason reason)
@@ -1174,7 +1186,7 @@ static BOOL rdg_get_gateway_credentials(rdpContext* context, rdp_auth_reason rea
 	}
 }
 
-static BOOL rdg_auth_init(rdpRdg* rdg, rdpTls* tls, TCHAR* authPkg)
+static BOOL rdg_auth_init(rdpRdg* rdg, rdpTransport* transport, TCHAR* authPkg)
 {
 	rdpContext* context = rdg->context;
 	rdpSettings* settings = context->settings;
@@ -1185,7 +1197,7 @@ static BOOL rdg_auth_init(rdpRdg* rdg, rdpTls* tls, TCHAR* authPkg)
 	if (!rdg->auth)
 		return FALSE;
 
-	if (!credssp_auth_init(rdg->auth, authPkg, tls->Bindings))
+	if (!credssp_auth_init(rdg->auth, authPkg, transport_get_channel_bindings(transport)))
 		return FALSE;
 
 	bool doSCLogon = freerdp_settings_get_bool(settings, FreeRDP_SmartcardLogon);
@@ -1244,7 +1256,7 @@ static BOOL rdg_auth_init(rdpRdg* rdg, rdpTls* tls, TCHAR* authPkg)
 	return TRUE;
 }
 
-static BOOL rdg_send_http_request(rdpRdg* rdg, rdpTls* tls, const char* method,
+static BOOL rdg_send_http_request(rdpRdg* rdg, rdpTransport* transport, const char* method,
                                   TRANSFER_ENCODING transferEncoding)
 {
 	size_t sz = 0;
@@ -1258,18 +1270,16 @@ static BOOL rdg_send_http_request(rdpRdg* rdg, rdpTls* tls, const char* method,
 	sz = Stream_Length(s);
 
 	if (sz <= INT_MAX)
-		status = freerdp_tls_write_all(tls, Stream_Buffer(s), (int)sz);
+		status = transport_write(transport, s);
 
 	Stream_Free(s, TRUE);
 	return (status >= 0);
 }
 
-static BOOL rdg_tls_connect(rdpRdg* rdg, rdpTls* tls, const char* peerAddress, int timeout)
+static BOOL rdg_transport_connect(rdpRdg* rdg, rdpTransport* transport, const char* peerAddress,
+                                  int timeout)
 {
 	int sockfd = 0;
-	long status = 0;
-	BIO* socketBio = NULL;
-	BIO* bufferedBio = NULL;
 	rdpSettings* settings = rdg->context->settings;
 	const char* peerHostname = settings->GatewayHostname;
 	UINT16 peerPort = (UINT16)settings->GatewayPort;
@@ -1281,78 +1291,45 @@ static BOOL rdg_tls_connect(rdpRdg* rdg, rdpTls* tls, const char* peerAddress, i
 	if (settings->GatewayPort > UINT16_MAX)
 		return FALSE;
 
-	sockfd = freerdp_tcp_connect(rdg->context, peerAddress ? peerAddress : peerHostname, peerPort,
-	                             timeout);
-
+	sockfd = transport_tcp_connect(transport, peerAddress ? peerAddress : peerHostname, peerPort,
+	                               timeout);
 	if (sockfd < 0)
-	{
 		return FALSE;
-	}
 
-	socketBio = BIO_new(BIO_s_simple_socket());
-
-	if (!socketBio)
-	{
-		closesocket((SOCKET)sockfd);
+	if (!transport_attach(transport, sockfd))
 		return FALSE;
-	}
 
-	BIO_set_fd(socketBio, sockfd, BIO_CLOSE);
-	bufferedBio = BIO_new(BIO_s_buffered_socket());
-
-	if (!bufferedBio)
-	{
-		BIO_free_all(socketBio);
+	if (!transport_set_blocking_mode(transport, TRUE))
 		return FALSE;
-	}
-
-	bufferedBio = BIO_push(bufferedBio, socketBio);
-	status = BIO_set_nonblock(bufferedBio, TRUE);
+	if (!transport_set_timeout(transport, timeout))
+		return FALSE;
 
 	if (isProxyConnection)
 	{
-		if (!proxy_connect(settings, bufferedBio, proxyUsername, proxyPassword,
-		                   settings->GatewayHostname, (UINT16)settings->GatewayPort))
+		if (!proxy_transport_connect(settings, transport, proxyUsername, proxyPassword,
+		                             settings->GatewayHostname, (UINT16)settings->GatewayPort))
 		{
-			BIO_free_all(bufferedBio);
 			return FALSE;
 		}
 	}
 
-	if (!status)
-	{
-		BIO_free_all(bufferedBio);
-		return FALSE;
-	}
-
-	tls->hostname = settings->GatewayHostname;
-	tls->port = (int)settings->GatewayPort;
-	tls->isGatewayTransport = TRUE;
-	status = freerdp_tls_connect(tls, bufferedBio);
-	if (status < 1)
+	if (!transport_connect_tls(transport))
 	{
 		rdpContext* context = rdg->context;
-		if (status < 0)
-		{
-			freerdp_set_last_error_if_not(context, FREERDP_ERROR_TLS_CONNECT_FAILED);
-		}
-		else
-		{
-			freerdp_set_last_error_if_not(context, FREERDP_ERROR_CONNECT_CANCELLED);
-		}
-
+		freerdp_set_last_error_if_not(context, FREERDP_ERROR_TLS_CONNECT_FAILED);
 		return FALSE;
 	}
-	return (status >= 1);
+
+	return TRUE;
 }
 
-static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* method,
+static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTransport* transport, const char* method,
                                           const char* peerAddress, int timeout, BOOL* rpcFallback)
 {
 	char buffer[64] = { 0 };
 	HttpResponse* response = NULL;
 
-	if (!rdg_tls_connect(rdg, tls, peerAddress, timeout))
+	if (!rdg_transport_connect(rdg, transport, peerAddress, timeout))
 		return FALSE;
 
 	WINPR_ASSERT(rpcFallback);
@@ -1360,13 +1337,13 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 		rdg->extAuth = HTTP_EXTENDED_AUTH_BEARER;
 	if (rdg->extAuth == HTTP_EXTENDED_AUTH_NONE)
 	{
-		if (!rdg_auth_init(rdg, tls, AUTH_PKG))
+		if (!rdg_auth_init(rdg, transport, AUTH_PKG))
 			return FALSE;
 
-		if (!rdg_send_http_request(rdg, tls, method, TransferEncodingIdentity))
+		if (!rdg_send_http_request(rdg, transport, method, TransferEncodingIdentity))
 			return FALSE;
 
-		response = http_response_recv(tls, TRUE);
+		response = http_response_transport_recv(transport, TRUE);
 		/* MS RD Gateway seems to just terminate the tls connection without
 		 * sending an answer if it is not happy with the http request */
 		if (!response)
@@ -1407,10 +1384,10 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 			{
 				http_response_free(response);
 
-				if (!rdg_send_http_request(rdg, tls, method, TransferEncodingIdentity))
+				if (!rdg_send_http_request(rdg, transport, method, TransferEncodingIdentity))
 					return FALSE;
 
-				response = http_response_recv(tls, TRUE);
+				response = http_response_transport_recv(transport, TRUE);
 				if (!response)
 				{
 					WLog_Print(rdg->log, WLOG_INFO, "RD Gateway HTTP transport broken.");
@@ -1427,10 +1404,10 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 		credssp_auth_free(rdg->auth);
 		rdg->auth = NULL;
 
-		if (!rdg_send_http_request(rdg, tls, method, TransferEncodingIdentity))
+		if (!rdg_send_http_request(rdg, transport, method, TransferEncodingIdentity))
 			return FALSE;
 
-		response = http_response_recv(tls, TRUE);
+		response = http_response_transport_recv(transport, TRUE);
 
 		if (!response)
 		{
@@ -1470,12 +1447,9 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 				 */
 				if (http_context_is_websocket_upgrade_enabled(rdg->http))
 				{
-					int fd = BIO_get_fd(tls->bio, NULL);
-					if (fd >= 0)
-						closesocket((SOCKET)fd);
 					http_context_enable_websocket_upgrade(rdg->http, FALSE);
-					return rdg_establish_data_connection(rdg, tls, method, peerAddress, timeout,
-					                                     rpcFallback);
+					return rdg_establish_data_connection(rdg, transport, method, peerAddress,
+					                                     timeout, rpcFallback);
 				}
 				return FALSE;
 			}
@@ -1486,7 +1460,7 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 			{
 				/* create a new auth context for SSPI_NTLM. This must be done after the last
 				 * rdg_send_http_request */
-				if (!rdg_auth_init(rdg, tls, NTLM_SSP_NAME))
+				if (!rdg_auth_init(rdg, transport, NTLM_SSP_NAME))
 					return FALSE;
 			}
 			return TRUE;
@@ -1505,21 +1479,21 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 			rdg->transferEncoding.context.chunked.headerFooterPos = 0;
 			rdg->transferEncoding.context.chunked.state = ChunkStateLenghHeader;
 		}
-		if (!rdg_skip_seed_payload(rdg->context, tls, bodyLength, &rdg->transferEncoding))
+		if (!rdg_skip_seed_payload(rdg->context, transport, bodyLength, &rdg->transferEncoding))
 		{
 			return FALSE;
 		}
 	}
 	else
 	{
-		if (!rdg_send_http_request(rdg, tls, method, TransferEncodingChunked))
+		if (!rdg_send_http_request(rdg, transport, method, TransferEncodingChunked))
 			return FALSE;
 
 		if (rdg->extAuth == HTTP_EXTENDED_AUTH_SSPI_NTLM)
 		{
 			/* create a new auth context for SSPI_NTLM. This must be done after the last
 			 * rdg_send_http_request (RDG_IN_DATA is always after RDG_OUT_DATA) */
-			if (!rdg_auth_init(rdg, tls, NTLM_SSP_NAME))
+			if (!rdg_auth_init(rdg, transport, NTLM_SSP_NAME))
 				return FALSE;
 		}
 	}
@@ -1560,12 +1534,10 @@ static BOOL rdg_tunnel_connect(rdpRdg* rdg)
 BOOL rdg_connect(rdpRdg* rdg, DWORD timeout, BOOL* rpcFallback)
 {
 	BOOL status = 0;
-	SOCKET outConnSocket = 0;
-	char* peerAddress = NULL;
 	BOOL rpcFallbackLocal = FALSE;
 
 	WINPR_ASSERT(rdg != NULL);
-	status = rdg_establish_data_connection(rdg, rdg->tlsOut, "RDG_OUT_DATA", NULL, timeout,
+	status = rdg_establish_data_connection(rdg, rdg->transportOut, "RDG_OUT_DATA", NULL, timeout,
 	                                       &rpcFallbackLocal);
 
 	if (status)
@@ -1579,11 +1551,8 @@ BOOL rdg_connect(rdpRdg* rdg, DWORD timeout, BOOL* rpcFallback)
 			/* Establish IN connection with the same peer/server as OUT connection,
 			 * even when server hostname resolves to different IP addresses.
 			 */
-			BIO_get_socket(rdg->tlsOut->underlying, &outConnSocket);
-			peerAddress = freerdp_tcp_get_peer_address(outConnSocket);
-			status = rdg_establish_data_connection(rdg, rdg->tlsIn, "RDG_IN_DATA", peerAddress,
+			status = rdg_establish_data_connection(rdg, rdg->transportIn, "RDG_IN_DATA", NULL,
 			                                       timeout, &rpcFallbackLocal);
-			free(peerAddress);
 		}
 	}
 
@@ -1651,18 +1620,18 @@ static int rdg_write_websocket_data_packet(rdpRdg* rdg, const BYTE* buf, int isi
 
 	Stream_Write_UINT8(sWS, WEBSOCKET_FIN_BIT | WebsocketBinaryOpcode);
 	if (payloadSize < 126)
-		Stream_Write_UINT8(sWS, payloadSize | WEBSOCKET_MASK_BIT);
+		Stream_Write_UINT8(sWS, (UINT8)(payloadSize | WEBSOCKET_MASK_BIT));
 	else if (payloadSize < 0x10000)
 	{
 		Stream_Write_UINT8(sWS, 126 | WEBSOCKET_MASK_BIT);
-		Stream_Write_UINT16_BE(sWS, payloadSize);
+		Stream_Write_UINT16_BE(sWS, (UINT16)payloadSize);
 	}
 	else
 	{
 		Stream_Write_UINT8(sWS, 127 | WEBSOCKET_MASK_BIT);
 		/* biggest packet possible is 0xffff + 0xa, so 32bit is always enough */
 		Stream_Write_UINT32_BE(sWS, 0);
-		Stream_Write_UINT32_BE(sWS, payloadSize);
+		Stream_Write_UINT32_BE(sWS, (UINT32)payloadSize);
 	}
 	Stream_Write_UINT32(sWS, maskingKey);
 
@@ -1692,7 +1661,7 @@ static int rdg_write_websocket_data_packet(rdpRdg* rdg, const BYTE* buf, int isi
 
 	Stream_SealLength(sWS);
 
-	status = freerdp_tls_write_all(rdg->tlsOut, Stream_Buffer(sWS), Stream_Length(sWS));
+	status = transport_write(rdg->transportOut, sWS);
 	Stream_Free(sWS, TRUE);
 
 	if (status < 0)
@@ -1738,7 +1707,7 @@ static int rdg_write_chunked_data_packet(rdpRdg* rdg, const BYTE* buf, int isize
 		return -1;
 	}
 
-	status = freerdp_tls_write_all(rdg->tlsIn, Stream_Buffer(sChunk), (int)len);
+	status = transport_write(rdg->transportIn, sChunk);
 	Stream_Free(sChunk, TRUE);
 
 	if (status < 0)
@@ -1847,8 +1816,6 @@ static BOOL rdg_process_control_packet(rdpRdg* rdg, int type, size_t packetLengt
 	if (packetLength < sizeof(RdgPacketHeader))
 		return FALSE;
 
-	WINPR_ASSERT(sizeof(RdgPacketHeader) < INT_MAX);
-
 	if (payloadSize)
 	{
 		s = Stream_New(NULL, payloadSize);
@@ -1863,19 +1830,12 @@ static BOOL rdg_process_control_packet(rdpRdg* rdg, int type, size_t packetLengt
 				Stream_Free(s, TRUE);
 				return FALSE;
 			}
-			status = rdg_socket_read(rdg->tlsOut->bio, Stream_Pointer(s), payloadSize - readCount,
+			status = rdg_socket_read(rdg->transportOut, Stream_Pointer(s), payloadSize - readCount,
 			                         &rdg->transferEncoding);
-
-			if (status <= 0)
-			{
-				if (!BIO_should_retry(rdg->tlsOut->bio))
-				{
-					Stream_Free(s, TRUE);
-					return FALSE;
-				}
-
+			if (status == 0)
 				continue;
-			}
+			if (status < 0)
+				return FALSE;
 
 			Stream_Seek(s, (size_t)status);
 			readCount += (size_t)status;
@@ -1932,28 +1892,22 @@ static int rdg_read_data_packet(rdpRdg* rdg, BYTE* buffer, int size)
 
 	if (!rdg->packetRemainingCount)
 	{
-		WINPR_ASSERT(sizeof(RdgPacketHeader) < INT_MAX);
-
 		while (readCount < sizeof(RdgPacketHeader))
 		{
 			if (rdg_shall_abort(rdg))
 				return -1;
 
-			status = rdg_socket_read(rdg->tlsOut->bio, (BYTE*)(&header) + readCount,
+			status = rdg_socket_read(rdg->transportOut, (BYTE*)(&header) + readCount,
 			                         (int)sizeof(RdgPacketHeader) - (int)readCount,
 			                         &rdg->transferEncoding);
-
-			if (status <= 0)
+			if (status == 0)
 			{
-				if (!BIO_should_retry(rdg->tlsOut->bio))
-					return -1;
-
 				if (!readCount)
 					return 0;
-
-				BIO_wait_read(rdg->tlsOut->bio, 50);
 				continue;
 			}
+			if (status < 0)
+				return -1;
 
 			readCount += (size_t)status;
 
@@ -1978,229 +1932,47 @@ static int rdg_read_data_packet(rdpRdg* rdg, BYTE* buffer, int size)
 			if (rdg_shall_abort(rdg))
 				return -1;
 			status =
-			    rdg_socket_read(rdg->tlsOut->bio, (BYTE*)(&rdg->packetRemainingCount) + readCount,
+			    rdg_socket_read(rdg->transportOut, (BYTE*)(&rdg->packetRemainingCount) + readCount,
 			                    2 - (int)readCount, &rdg->transferEncoding);
-
-			if (status < 0)
-			{
-				if (!BIO_should_retry(rdg->tlsOut->bio))
-					return -1;
-
-				BIO_wait_read(rdg->tlsOut->bio, 50);
+			if (status == 0)
 				continue;
-			}
+			if (status < 0)
+				return -1;
 
 			readCount += (size_t)status;
 		}
 	}
 
 	readSize = (rdg->packetRemainingCount < size) ? rdg->packetRemainingCount : size;
-	status = rdg_socket_read(rdg->tlsOut->bio, buffer, readSize, &rdg->transferEncoding);
+	status = rdg_socket_read(rdg->transportOut, buffer, readSize, &rdg->transferEncoding);
 
 	if (status <= 0)
-	{
-		if (!BIO_should_retry(rdg->tlsOut->bio))
-		{
-			return -1;
-		}
+		return status;
 
-		return 0;
-	}
-
-	rdg->packetRemainingCount -= status;
+	rdg->packetRemainingCount -= (UINT16)status;
 	return status;
 }
 
-static int rdg_bio_write(BIO* bio, const char* buf, int num)
+static int rdg_tunnel_read(void* arg, BYTE* data, int size)
 {
 	int status = 0;
-	rdpRdg* rdg = (rdpRdg*)BIO_get_data(bio);
-	BIO_clear_flags(bio, BIO_FLAGS_WRITE);
+	rdpRdg* rdg = (rdpRdg*)arg;
+
+	status = rdg_read_data_packet(rdg, data, size);
+
+	return status;
+}
+
+static int rdg_tunnel_write(void* arg, const BYTE* data, int size)
+{
+	int status = 0;
+	rdpRdg* rdg = (rdpRdg*)arg;
+
 	EnterCriticalSection(&rdg->writeSection);
-	status = rdg_write_data_packet(rdg, (const BYTE*)buf, num);
+	status = rdg_write_data_packet(rdg, data, size);
 	LeaveCriticalSection(&rdg->writeSection);
 
-	if (status < 0)
-	{
-		BIO_clear_flags(bio, BIO_FLAGS_SHOULD_RETRY);
-		return -1;
-	}
-	else if (status < num)
-	{
-		BIO_set_flags(bio, BIO_FLAGS_WRITE);
-		WSASetLastError(WSAEWOULDBLOCK);
-	}
-	else
-	{
-		BIO_set_flags(bio, BIO_FLAGS_WRITE);
-	}
-
 	return status;
-}
-
-static int rdg_bio_read(BIO* bio, char* buf, int size)
-{
-	int status = 0;
-	rdpRdg* rdg = (rdpRdg*)BIO_get_data(bio);
-	status = rdg_read_data_packet(rdg, (BYTE*)buf, size);
-
-	if (status < 0)
-	{
-		BIO_clear_retry_flags(bio);
-		return -1;
-	}
-	else if (status == 0)
-	{
-		BIO_set_retry_read(bio);
-		WSASetLastError(WSAEWOULDBLOCK);
-		return -1;
-	}
-	else
-	{
-		BIO_set_flags(bio, BIO_FLAGS_READ);
-	}
-
-	return status;
-}
-
-static int rdg_bio_puts(BIO* bio, const char* str)
-{
-	WINPR_UNUSED(bio);
-	WINPR_UNUSED(str);
-	return -2;
-}
-
-static int rdg_bio_gets(BIO* bio, char* str, int size)
-{
-	WINPR_UNUSED(bio);
-	WINPR_UNUSED(str);
-	WINPR_UNUSED(size);
-	return -2;
-}
-
-static long rdg_bio_ctrl(BIO* in_bio, int cmd, long arg1, void* arg2)
-{
-	long status = -1;
-	rdpRdg* rdg = (rdpRdg*)BIO_get_data(in_bio);
-	rdpTls* tlsOut = rdg->tlsOut;
-	rdpTls* tlsIn = rdg->tlsIn;
-
-	if (cmd == BIO_CTRL_FLUSH)
-	{
-		(void)BIO_flush(tlsOut->bio);
-		if (!rdg->transferEncoding.isWebsocketTransport)
-			(void)BIO_flush(tlsIn->bio);
-		status = 1;
-	}
-	else if (cmd == BIO_C_SET_NONBLOCK)
-	{
-		status = 1;
-	}
-	else if (cmd == BIO_C_READ_BLOCKED)
-	{
-		BIO* cbio = tlsOut->bio;
-		status = BIO_read_blocked(cbio);
-	}
-	else if (cmd == BIO_C_WRITE_BLOCKED)
-	{
-		BIO* cbio = tlsIn->bio;
-
-		if (rdg->transferEncoding.isWebsocketTransport)
-			cbio = tlsOut->bio;
-
-		status = BIO_write_blocked(cbio);
-	}
-	else if (cmd == BIO_C_WAIT_READ)
-	{
-		int timeout = (int)arg1;
-		BIO* cbio = tlsOut->bio;
-
-		if (BIO_read_blocked(cbio))
-			return BIO_wait_read(cbio, timeout);
-		else if (BIO_write_blocked(cbio))
-			return BIO_wait_write(cbio, timeout);
-		else
-			status = 1;
-	}
-	else if (cmd == BIO_C_WAIT_WRITE)
-	{
-		int timeout = (int)arg1;
-		BIO* cbio = tlsIn->bio;
-
-		if (rdg->transferEncoding.isWebsocketTransport)
-			cbio = tlsOut->bio;
-
-		if (BIO_write_blocked(cbio))
-			status = BIO_wait_write(cbio, timeout);
-		else if (BIO_read_blocked(cbio))
-			status = BIO_wait_read(cbio, timeout);
-		else
-			status = 1;
-	}
-	else if (cmd == BIO_C_GET_EVENT || cmd == BIO_C_GET_FD)
-	{
-		/*
-		 * A note about BIO_C_GET_FD:
-		 * Even if two FDs are part of RDG, only one FD can be returned here.
-		 *
-		 * In FreeRDP, BIO FDs are only used for polling, so it is safe to use the outgoing FD only
-		 *
-		 * See issue #3602
-		 */
-		status = BIO_ctrl(tlsOut->bio, cmd, arg1, arg2);
-	}
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-	else if (cmd == BIO_CTRL_GET_KTLS_SEND)
-	{
-		/* Even though BIO_get_ktls_send says that returning negative values is valid
-		 * openssl internal sources are full of if(!BIO_get_ktls_send && ) stuff. This has some
-		 * nasty sideeffects. return 0 as proper no KTLS offloading flag
-		 */
-		status = 0;
-	}
-	else if (cmd == BIO_CTRL_GET_KTLS_RECV)
-	{
-		/* Even though BIO_get_ktls_recv says that returning negative values is valid
-		 * there is no reason to trust  trust negative values are implemented right everywhere
-		 */
-		status = 0;
-	}
-#endif
-	return status;
-}
-
-static int rdg_bio_new(BIO* bio)
-{
-	BIO_set_init(bio, 1);
-	BIO_set_flags(bio, BIO_FLAGS_SHOULD_RETRY);
-	return 1;
-}
-
-static int rdg_bio_free(BIO* bio)
-{
-	WINPR_UNUSED(bio);
-	return 1;
-}
-
-static BIO_METHOD* BIO_s_rdg(void)
-{
-	static BIO_METHOD* bio_methods = NULL;
-
-	if (bio_methods == NULL)
-	{
-		if (!(bio_methods = BIO_meth_new(BIO_TYPE_TSG, "RDGateway")))
-			return NULL;
-
-		BIO_meth_set_write(bio_methods, rdg_bio_write);
-		BIO_meth_set_read(bio_methods, rdg_bio_read);
-		BIO_meth_set_puts(bio_methods, rdg_bio_puts);
-		BIO_meth_set_gets(bio_methods, rdg_bio_gets);
-		BIO_meth_set_ctrl(bio_methods, rdg_bio_ctrl);
-		BIO_meth_set_create(bio_methods, rdg_bio_new);
-		BIO_meth_set_destroy(bio_methods, rdg_bio_free);
-	}
-
-	return bio_methods;
 }
 
 rdpRdg* rdg_new(rdpContext* context)
@@ -2226,14 +1998,14 @@ rdpRdg* rdg_new(rdpContext* context)
 
 		UuidCreate(&rdg->guid);
 
-		rdg->tlsOut = freerdp_tls_new(rdg->context);
+		rdg->transportOut = rdp_transport_new(rdg->context->rdp);
 
-		if (!rdg->tlsOut)
+		if (!rdg->transportOut)
 			goto rdg_alloc_error;
 
-		rdg->tlsIn = freerdp_tls_new(rdg->context);
+		rdg->transportIn = rdp_transport_new(rdg->context->rdp);
 
-		if (!rdg->tlsIn)
+		if (!rdg->transportIn)
 			goto rdg_alloc_error;
 
 		rdg->http = http_context_new();
@@ -2279,16 +2051,14 @@ rdpRdg* rdg_new(rdpContext* context)
 			}
 		}
 
-		rdg->frontBio = BIO_new(BIO_s_rdg());
-
-		if (!rdg->frontBio)
-			goto rdg_alloc_error;
-
-		BIO_set_data(rdg->frontBio, rdg);
 		InitializeCriticalSection(&rdg->writeSection);
 
 		rdg->transferEncoding.httpTransferEncoding = TransferEncodingIdentity;
 		rdg->transferEncoding.isWebsocketTransport = FALSE;
+
+		rdg->tunnelIo.arg = rdg;
+		rdg->tunnelIo.tunnelRead = rdg_tunnel_read;
+		rdg->tunnelIo.tunnelWrite = rdg_tunnel_write;
 	}
 
 	return rdg;
@@ -2305,13 +2075,10 @@ void rdg_free(rdpRdg* rdg)
 	if (!rdg)
 		return;
 
-	freerdp_tls_free(rdg->tlsOut);
-	freerdp_tls_free(rdg->tlsIn);
+	transport_free(rdg->transportOut);
+	transport_free(rdg->transportIn);
 	http_context_free(rdg->http);
 	credssp_auth_free(rdg->auth);
-
-	if (!rdg->attached)
-		BIO_free_all(rdg->frontBio);
 
 	DeleteCriticalSection(&rdg->writeSection);
 
@@ -2324,13 +2091,4 @@ void rdg_free(rdpRdg* rdg)
 	smartcardCertInfo_Free(rdg->smartcard);
 
 	free(rdg);
-}
-
-BIO* rdg_get_front_bio_and_take_ownership(rdpRdg* rdg)
-{
-	if (!rdg)
-		return NULL;
-
-	rdg->attached = TRUE;
-	return rdg->frontBio;
 }

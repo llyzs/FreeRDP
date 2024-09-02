@@ -21,6 +21,7 @@
 #include <errno.h>
 
 #include <openssl/err.h>
+#include <openssl/x509.h>
 
 #include "settings.h"
 #include "proxy.h"
@@ -28,6 +29,7 @@
 #include <freerdp/utils/proxy_utils.h>
 #include <freerdp/crypto/crypto.h>
 #include "tcp.h"
+#include "transport.h"
 
 #include <winpr/assert.h>
 #include <winpr/environment.h> /* For GetEnvironmentVariableA */
@@ -72,8 +74,14 @@ static const char* rplstat[] = { "succeeded",
 
 static BOOL http_proxy_connect(BIO* bufferedBio, const char* proxyUsername,
                                const char* proxyPassword, const char* hostname, UINT16 port);
+static BOOL http_proxy_transport_connect(rdpTransport* transport, const char* proxyUsername,
+                                         const char* proxyPassword, const char* hostname,
+                                         UINT16 port);
 static BOOL socks_proxy_connect(BIO* bufferedBio, const char* proxyUsername,
                                 const char* proxyPassword, const char* hostname, UINT16 port);
+static BOOL socks_proxy_transport_connect(rdpTransport* transport, const char* proxyUsername,
+                                          const char* proxyPassword, const char* hostname,
+                                          UINT16 port);
 static void proxy_read_environment(rdpSettings* settings, char* envname);
 
 BOOL proxy_prepare(rdpSettings* settings, const char** lpPeerHostname, UINT16* lpPeerPort,
@@ -504,6 +512,30 @@ BOOL proxy_connect(rdpSettings* settings, BIO* bufferedBio, const char* proxyUse
 	}
 }
 
+BOOL proxy_transport_connect(rdpSettings* settings, rdpTransport* transport,
+                             const char* proxyUsername, const char* proxyPassword,
+                             const char* hostname, UINT16 port)
+{
+	switch (freerdp_settings_get_uint32(settings, FreeRDP_ProxyType))
+	{
+		case PROXY_TYPE_NONE:
+		case PROXY_TYPE_IGNORE:
+			return TRUE;
+
+		case PROXY_TYPE_HTTP:
+			return http_proxy_transport_connect(transport, proxyUsername, proxyPassword, hostname,
+			                                    port);
+
+		case PROXY_TYPE_SOCKS:
+			return socks_proxy_transport_connect(transport, proxyUsername, proxyPassword, hostname,
+			                                     port);
+
+		default:
+			WLog_ERR(TAG, "Invalid internal proxy configuration");
+			return FALSE;
+	}
+}
+
 static const char* get_response_header(char* response)
 {
 	char* current_pos = strchr(response, '\r');
@@ -661,6 +693,144 @@ fail:
 	return rc;
 }
 
+static BOOL http_proxy_transport_connect(rdpTransport* transport, const char* proxyUsername,
+                                         const char* proxyPassword, const char* hostname,
+                                         UINT16 port)
+{
+	BOOL rc = FALSE;
+	int status = 0;
+	wStream* s = NULL;
+	char port_str[10] = { 0 };
+	char recv_buf[256] = { 0 };
+	char* eol = NULL;
+	size_t resultsize = 0;
+	size_t reserveSize = 0;
+	size_t portLen = 0;
+	size_t hostLen = 0;
+	const char connect[] = "CONNECT ";
+	const char httpheader[] = " HTTP/1.1" CRLF "Host: ";
+
+	WINPR_ASSERT(transport);
+	WINPR_ASSERT(hostname);
+
+	_itoa_s(port, port_str, sizeof(port_str), 10);
+
+	hostLen = strlen(hostname);
+	portLen = strnlen(port_str, sizeof(port_str));
+	reserveSize = strlen(connect) + (hostLen + 1 + portLen) * 2 + strlen(httpheader);
+	s = Stream_New(NULL, reserveSize);
+	if (!s)
+		goto fail;
+
+	Stream_Write(s, connect, strlen(connect));
+	Stream_Write(s, hostname, hostLen);
+	Stream_Write_UINT8(s, ':');
+	Stream_Write(s, port_str, portLen);
+	Stream_Write(s, httpheader, strlen(httpheader));
+	Stream_Write(s, hostname, hostLen);
+	Stream_Write_UINT8(s, ':');
+	Stream_Write(s, port_str, portLen);
+
+	if (proxyUsername && proxyPassword)
+	{
+		const int length = _scprintf("%s:%s", proxyUsername, proxyPassword);
+		if (length > 0)
+		{
+			const size_t size = (size_t)length + 1ull;
+			char* creds = (char*)malloc(size);
+
+			if (!creds)
+				goto fail;
+			else
+			{
+				const char basic[] = CRLF "Proxy-Authorization: Basic ";
+				char* base64 = NULL;
+
+				sprintf_s(creds, size, "%s:%s", proxyUsername, proxyPassword);
+				base64 = crypto_base64_encode((const BYTE*)creds, size - 1);
+
+				if (!base64 || !Stream_EnsureRemainingCapacity(s, strlen(basic) + strlen(base64)))
+				{
+					free(base64);
+					free(creds);
+					goto fail;
+				}
+				Stream_Write(s, basic, strlen(basic));
+				Stream_Write(s, base64, strlen(base64));
+
+				free(base64);
+			}
+			free(creds);
+		}
+	}
+
+	if (!Stream_EnsureRemainingCapacity(s, 4))
+		goto fail;
+
+	Stream_Write(s, CRLF CRLF, 4);
+	Stream_SealLength(s);
+
+	status = transport_write(transport, s);
+
+	if (status <= 0)
+	{
+		WLog_ERR(TAG, "HTTP proxy: failed to write CONNECT request");
+		goto fail;
+	}
+
+	/* Read result until CR-LF-CR-LF.
+	 * Keep recv_buf a null-terminated string. */
+	while (strstr(recv_buf, CRLF CRLF) == NULL)
+	{
+		if (resultsize >= sizeof(recv_buf) - 1)
+		{
+			WLog_ERR(TAG, "HTTP Reply headers too long: %s", get_response_header(recv_buf));
+			goto fail;
+		}
+
+		status = transport_read_bytes(transport, (BYTE*)recv_buf + resultsize, 1);
+
+		if (status < 0)
+		{
+			WLog_ERR(TAG, "Failed reading reply from HTTP proxy (Status %d)", status);
+			goto fail;
+		}
+		else if (status == 0)
+		{
+			/* Error? */
+			WLog_ERR(TAG, "Failed reading reply from HTTP proxy (BIO_read returned zero)");
+			goto fail;
+		}
+
+		resultsize += status;
+	}
+
+	/* Extract HTTP status line */
+	eol = strchr(recv_buf, '\r');
+
+	if (!eol)
+	{
+		/* should never happen */
+		goto fail;
+	}
+
+	*eol = '\0';
+	WLog_INFO(TAG, "HTTP Proxy: %s", recv_buf);
+
+	if (strnlen(recv_buf, sizeof(recv_buf)) < 12)
+		goto fail;
+
+	recv_buf[7] = 'X';
+
+	if (strncmp(recv_buf, "HTTP/1.X 200", 12))
+		goto fail;
+
+	rc = TRUE;
+fail:
+	Stream_Free(s, TRUE);
+	return rc;
+}
+
 static int recv_socks_reply(BIO* bufferedBio, BYTE* buf, int len, char* reason, BYTE checkVer)
 {
 	int status = 0;
@@ -701,6 +871,31 @@ static int recv_socks_reply(BIO* bufferedBio, BYTE* buf, int len, char* reason, 
 		return -1;
 	}
 
+	if (buf[0] != checkVer)
+	{
+		WLog_ERR(TAG, "SOCKS Proxy version is not 5 (%s)", reason);
+		return -1;
+	}
+
+	return status;
+}
+
+static int recv_socks_transport_reply(rdpTransport* transport, BYTE* buf, int len, char* reason,
+                                      BYTE checkVer)
+{
+	int status = 0;
+
+	status = transport_read_bytes(transport, buf, len);
+	if (status <= 0)
+	{
+		WLog_ERR(TAG, "Failed reading %s reply from SOCKS proxy (Status %d)", reason, status);
+		return status;
+	}
+	if (status < 2)
+	{
+		WLog_ERR(TAG, "SOCKS Proxy reply packet too short (%s)", reason);
+		return -1;
+	}
 	if (buf[0] != checkVer)
 	{
 		WLog_ERR(TAG, "SOCKS Proxy version is not 5 (%s)", reason);
@@ -841,4 +1036,180 @@ static BOOL socks_proxy_connect(BIO* bufferedBio, const char* proxyUsername,
 		WLog_INFO(TAG, "SOCKS Proxy replied: %" PRIu8 " status not listed in rfc1928", buf[1]);
 
 	return FALSE;
+}
+
+static BOOL socks_proxy_transport_connect(rdpTransport* transport, const char* proxyUsername,
+                                          const char* proxyPassword, const char* hostname,
+                                          UINT16 port)
+{
+	int status = 0;
+	int nauthMethods = 1;
+	BYTE buf[256];
+	wStream* s;
+	size_t hostnlen = strnlen(hostname, 255);
+
+	if (proxyUsername && proxyPassword)
+		nauthMethods++;
+
+	/* select auth. method */
+	s = Stream_New(NULL, 4);
+	if (!s)
+		return FALSE;
+	Stream_Write_UINT8(s, 5);            /* SOCKS version */
+	Stream_Write_UINT8(s, nauthMethods); /* #of methods offered */
+	Stream_Write_UINT8(s, AUTH_M_NO_AUTH);
+
+	if (nauthMethods > 1)
+		Stream_Write_UINT8(s, AUTH_M_USR_PASS);
+
+	Stream_SealLength(s);
+
+	status = transport_write(transport, s);
+	Stream_Free(s, TRUE);
+
+	if (status <= 0)
+	{
+		WLog_ERR(TAG, "SOCKS proxy: failed to write AUTH METHOD request");
+		return FALSE;
+	}
+
+	status = recv_socks_transport_reply(transport, buf, 2, "AUTH REQ", 5);
+
+	if (status <= 0)
+		return FALSE;
+
+	switch (buf[1])
+	{
+		case AUTH_M_NO_AUTH:
+			WLog_DBG(TAG, "SOCKS Proxy: (NO AUTH) method was selected");
+			break;
+
+		case AUTH_M_USR_PASS:
+			if (!proxyUsername || !proxyPassword)
+				return FALSE;
+			else
+			{
+				int usernameLen = strnlen(proxyUsername, 255);
+				int userpassLen = strnlen(proxyPassword, 255);
+
+				if (nauthMethods < 2)
+				{
+					WLog_ERR(TAG, "SOCKS Proxy: USER/PASS method was not proposed to server");
+					return FALSE;
+				}
+
+				/* user/password v1 method */
+				s = Stream_New(NULL, 3 + usernameLen + userpassLen);
+				if (!s)
+					return FALSE;
+				Stream_Write_UINT8(s, 1);
+				Stream_Write_UINT8(s, usernameLen);
+				Stream_Write(s, proxyUsername, usernameLen);
+				Stream_Write_UINT8(s, userpassLen);
+				Stream_Write(s, proxyPassword, userpassLen);
+				Stream_SealLength(s);
+
+				status = transport_write(transport, s);
+				Stream_Free(s, TRUE);
+
+				if (status != 3 + usernameLen + userpassLen)
+				{
+					WLog_ERR(TAG, "SOCKS Proxy: error writing user/password request");
+					return FALSE;
+				}
+
+				status = recv_socks_transport_reply(transport, buf, 2, "AUTH REQ", 1);
+
+				if (status < 2)
+					return FALSE;
+
+				if (buf[1] != 0x00)
+				{
+					WLog_ERR(TAG, "SOCKS Proxy: invalid user/password");
+					return FALSE;
+				}
+			}
+
+			break;
+
+		default:
+			WLog_ERR(TAG, "SOCKS Proxy: unknown method 0x%x was selected by proxy", buf[1]);
+			return FALSE;
+	}
+
+	/* CONN request */
+	s = Stream_New(NULL, 7 + hostnlen);
+	Stream_Write_UINT8(s, 5);                 /* SOCKS version */
+	Stream_Write_UINT8(s, SOCKS_CMD_CONNECT); /* command */
+	Stream_Write_UINT8(s, 0);                 /* 3rd octet is reserved x00 */
+	Stream_Write_UINT8(s, SOCKS_ADDR_FQDN);   /* addr.type */
+	Stream_Write_UINT8(s, hostnlen);          /* DST.ADDR */
+	Stream_Write(s, hostname, hostnlen);
+	/* follows DST.PORT in netw. format */
+	Stream_Write_UINT8(s, (port >> 8) & 0xff);
+	Stream_Write_UINT8(s, port & 0xff);
+	Stream_SealLength(s);
+
+	status = transport_write(transport, s);
+	Stream_Free(s, TRUE);
+
+	if ((status < 0) || ((size_t)status != (hostnlen + 7U)))
+	{
+		WLog_ERR(TAG, "SOCKS proxy: failed to write CONN REQ");
+		return FALSE;
+	}
+
+	status = transport_read_bytes(transport, buf, 4);
+
+	if (status < 4)
+		return FALSE;
+
+	if (buf[1])
+	{
+		if (buf[1] < 9)
+			WLog_INFO(TAG, "SOCKS Proxy replied: %s", rplstat[buf[1]]);
+		else
+			WLog_INFO(TAG, "SOCKS Proxy replied: %" PRIu8 " status not listed in rfc1928", buf[1]);
+
+		return FALSE;
+	}
+
+	/* SOCKS5 address */
+	BYTE* ptr = buf + 4;
+	switch (buf[3])
+	{
+		case SOCKS_ADDR_IPV4:
+			status = transport_read_bytes(transport, ptr, 4);
+			if (status < 4)
+				return FALSE;
+			ptr += 4;
+			break;
+
+		case SOCKS_ADDR_FQDN:
+			status = transport_read_bytes(transport, ptr, 1);
+			if (status < 1)
+				return FALSE;
+			ptr += 1;
+			status = transport_read_bytes(transport, ptr, buf[4]);
+			if (status < buf[4])
+				return FALSE;
+			ptr += buf[4];
+			break;
+
+		case SOCKS_ADDR_IPV6:
+			status = transport_read_bytes(transport, ptr, 16);
+			if (status < 16)
+				return FALSE;
+			ptr += 16;
+			break;
+	}
+
+	/* Port */
+	status = transport_read_bytes(transport, ptr, 2);
+	if (status < 2)
+		return FALSE;
+
+	WLog_INFO(TAG, "Successfully connected to %s:%" PRIu16, hostname, port);
+
+	return TRUE;
 }

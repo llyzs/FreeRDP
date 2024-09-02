@@ -29,4 +29,8 @@ BOOL proxy_prepare(rdpSettings* settings, const char** lpPeerHostname, UINT16* l
 BOOL proxy_connect(rdpSettings* settings, BIO* bio, const char* proxyUsername,
                    const char* proxyPassword, const char* hostname, UINT16 port);
 
+BOOL proxy_transport_connect(rdpSettings* settings, rdpTransport* transport,
+                             const char* proxyUsername, const char* proxyPassword,
+                             const char* hostname, UINT16 port);
+
 #endif /* FREERDP_LIB_CORE_HTTP_PROXY_H */

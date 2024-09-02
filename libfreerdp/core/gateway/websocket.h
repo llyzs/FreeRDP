@@ -68,4 +68,11 @@ FREERDP_LOCAL int websocket_write(BIO* bio, const BYTE* buf, int isize, WEBSOCKE
 FREERDP_LOCAL int websocket_read(BIO* bio, BYTE* pBuffer, size_t size,
                                  websocket_context* encodingContext);
 
+FREERDP_LOCAL BOOL websocket_transport_write_wstream(rdpTransport* transport, wStream* sPacket,
+                                                     WEBSOCKET_OPCODE opcode);
+FREERDP_LOCAL int websocket_transport_write(rdpTransport* transport, const BYTE* buf, int isize,
+                                            WEBSOCKET_OPCODE opcode);
+FREERDP_LOCAL int websocket_transport_read(rdpTransport* transport, BYTE* pBuffer, size_t size,
+                                           websocket_context* encodingContext);
+
 #endif /* FREERDP_LIB_CORE_GATEWAY_WEBSOCKET_H */

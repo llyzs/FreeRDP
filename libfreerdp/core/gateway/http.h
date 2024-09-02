@@ -113,6 +113,8 @@ WINPR_ATTR_MALLOC(http_response_free, 1)
 FREERDP_LOCAL HttpResponse* http_response_new(void);
 
 FREERDP_LOCAL HttpResponse* http_response_recv(rdpTls* tls, BOOL readContentLength);
+FREERDP_LOCAL HttpResponse* http_response_transport_recv(rdpTransport* transport,
+                                                         BOOL readContentLength);
 
 FREERDP_LOCAL long http_response_get_status_code(const HttpResponse* response);
 FREERDP_LOCAL size_t http_response_get_body_length(const HttpResponse* response);
@@ -131,5 +133,7 @@ FREERDP_LOCAL void http_response_log_error_status(wLog* log, DWORD level,
 /* chunked read helper */
 FREERDP_LOCAL int http_chuncked_read(BIO* bio, BYTE* pBuffer, size_t size,
                                      http_encoding_chunked_context* encodingContext);
+FREERDP_LOCAL int http_transport_chuncked_read(rdpTransport* transport, BYTE* pBuffer, size_t size,
+                                               http_encoding_chunked_context* encodingContext);
 
 #endif /* FREERDP_LIB_CORE_GATEWAY_HTTP_H */

@@ -86,10 +86,14 @@ FREERDP_LOCAL BOOL transport_accept_nla(rdpTransport* transport);
 FREERDP_LOCAL BOOL transport_accept_rdstls(rdpTransport* transport);
 
 FREERDP_LOCAL int transport_read_pdu(rdpTransport* transport, wStream* s);
+FREERDP_LOCAL SSIZE_T transport_read_bytes(rdpTransport* transport, BYTE* data, size_t bytes);
 FREERDP_LOCAL int transport_write(rdpTransport* transport, wStream* s);
 
 FREERDP_LOCAL BOOL transport_get_public_key(rdpTransport* transport, const BYTE** data,
                                             DWORD* length);
+FREERDP_LOCAL const SecPkgContext_Bindings* transport_get_channel_bindings(rdpTransport* transport);
+
+FREERDP_LOCAL BOOL transport_tunnel(rdpTransport* transport, rdpTransportTunnelIo* tunnelIo);
 
 #if defined(WITH_FREERDP_DEPRECATED)
 FREERDP_LOCAL void transport_get_fds(rdpTransport* transport, void** rfds, int* rcount);
@@ -101,15 +105,13 @@ FREERDP_LOCAL DWORD transport_get_event_handles(rdpTransport* transport, HANDLE*
 FREERDP_LOCAL HANDLE transport_get_front_bio(rdpTransport* transport);
 
 FREERDP_LOCAL BOOL transport_set_blocking_mode(rdpTransport* transport, BOOL blocking);
+FREERDP_LOCAL BOOL transport_set_timeout(rdpTransport* transport, DWORD timeout);
 FREERDP_LOCAL void transport_set_gateway_enabled(rdpTransport* transport, BOOL GatewayEnabled);
 FREERDP_LOCAL void transport_set_nla_mode(rdpTransport* transport, BOOL NlaMode);
 FREERDP_LOCAL void transport_set_rdstls_mode(rdpTransport* transport, BOOL RdstlsMode);
 FREERDP_LOCAL void transport_set_aad_mode(rdpTransport* transport, BOOL AadMode);
 FREERDP_LOCAL BOOL transport_is_write_blocked(rdpTransport* transport);
 FREERDP_LOCAL int transport_drain_output_buffer(rdpTransport* transport);
-
-FREERDP_LOCAL wStream* transport_receive_pool_take(rdpTransport* transport);
-FREERDP_LOCAL int transport_receive_pool_return(rdpTransport* transport, wStream* pdu);
 
 FREERDP_LOCAL BOOL transport_io_callback_set_event(rdpTransport* transport, BOOL set);
 
@@ -136,7 +138,6 @@ FREERDP_LOCAL TRANSPORT_LAYER transport_get_layer(rdpTransport* transport);
 FREERDP_LOCAL BOOL transport_set_layer(rdpTransport* transport, TRANSPORT_LAYER layer);
 
 FREERDP_LOCAL BOOL transport_get_blocking(rdpTransport* transport);
-FREERDP_LOCAL BOOL transport_set_blocking(rdpTransport* transport, BOOL blocking);
 
 FREERDP_LOCAL BOOL transport_set_connected_event(rdpTransport* transport);
 

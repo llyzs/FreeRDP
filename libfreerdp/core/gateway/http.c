@@ -40,6 +40,7 @@
 
 #include "http.h"
 #include "../tcp.h"
+#include "../transport.h"
 
 #define TAG FREERDP_TAG("core.gateway.http")
 
@@ -1222,6 +1223,109 @@ int http_chuncked_read(BIO* bio, BYTE* pBuffer, size_t size,
 	}
 }
 
+int http_transport_chuncked_read(rdpTransport* transport, BYTE* pBuffer, size_t size,
+                                 http_encoding_chunked_context* encodingContext)
+{
+	int status = 0;
+	int effectiveDataLen = 0;
+	WINPR_ASSERT(transport);
+	WINPR_ASSERT(pBuffer);
+	WINPR_ASSERT(encodingContext != NULL);
+	while (TRUE)
+	{
+		switch (encodingContext->state)
+		{
+			case ChunkStateData:
+			{
+				status = transport_read_bytes(
+				    transport, pBuffer,
+				    (size > encodingContext->nextOffset ? encodingContext->nextOffset : size));
+				if (status <= 0)
+					return (effectiveDataLen > 0 ? effectiveDataLen : status);
+
+				encodingContext->nextOffset -= status;
+				if (encodingContext->nextOffset == 0)
+				{
+					encodingContext->state = ChunkStateFooter;
+					encodingContext->headerFooterPos = 0;
+				}
+				effectiveDataLen += status;
+
+				if ((size_t)status == size)
+					return effectiveDataLen;
+
+				size -= status;
+			}
+			break;
+			case ChunkStateFooter:
+			{
+				char _dummy[2] = { 0 };
+				WINPR_ASSERT(encodingContext->nextOffset == 0);
+				WINPR_ASSERT(encodingContext->headerFooterPos < 2);
+				status =
+				    transport_read_bytes(transport, _dummy, 2 - encodingContext->headerFooterPos);
+				if (status >= 0)
+				{
+					encodingContext->headerFooterPos += status;
+					if (encodingContext->headerFooterPos == 2)
+					{
+						encodingContext->state = ChunkStateLenghHeader;
+						encodingContext->headerFooterPos = 0;
+					}
+				}
+				else
+					return (effectiveDataLen > 0 ? effectiveDataLen : status);
+			}
+			break;
+			case ChunkStateLenghHeader:
+			{
+				BOOL _haveNewLine = FALSE;
+				char* dst = &encodingContext->lenBuffer[encodingContext->headerFooterPos];
+				WINPR_ASSERT(encodingContext->nextOffset == 0);
+				while (encodingContext->headerFooterPos < 10 && !_haveNewLine)
+				{
+					status = transport_read_bytes(transport, dst, 1);
+					if (status >= 0)
+					{
+						if (*dst == '\n')
+							_haveNewLine = TRUE;
+						encodingContext->headerFooterPos += status;
+						dst += status;
+					}
+					else
+						return (effectiveDataLen > 0 ? effectiveDataLen : status);
+				}
+				*dst = '\0';
+				/* strtoul is tricky, error are reported via errno, we also need
+				 * to ensure the result does not overflow */
+				errno = 0;
+				size_t tmp = strtoul(encodingContext->lenBuffer, NULL, 16);
+				if ((errno != 0) || (tmp > SIZE_MAX))
+				{
+					/* denote end of stream if something bad happens */
+					encodingContext->nextOffset = 0;
+					encodingContext->state = ChunkStateEnd;
+					return -1;
+				}
+				encodingContext->nextOffset = tmp;
+				encodingContext->state = ChunkStateData;
+
+				if (encodingContext->nextOffset == 0)
+				{ /* end of stream */
+					WLog_DBG(TAG, "chunked encoding end of stream received");
+					encodingContext->headerFooterPos = 0;
+					encodingContext->state = ChunkStateEnd;
+					return (effectiveDataLen > 0 ? effectiveDataLen : 0);
+				}
+			}
+			break;
+			default:
+				/* invalid state / ChunkStateEnd */
+				return -1;
+		}
+	}
+}
+
 #define sleep_or_timeout(tls, startMS, timeoutMS) \
 	sleep_or_timeout_((tls), (startMS), (timeoutMS), __FILE__, __func__, __LINE__)
 static BOOL sleep_or_timeout_(rdpTls* tls, UINT64 startMS, UINT32 timeoutMS, const char* file,
@@ -1283,6 +1387,56 @@ static SSIZE_T http_response_recv_line(rdpTls* tls, HttpResponse* response)
 				goto out_error;
 			continue;
 		}
+
+#ifdef FREERDP_HAVE_VALGRIND_MEMCHECK_H
+		VALGRIND_MAKE_MEM_DEFINED(Stream_Pointer(response->data), status);
+#endif
+		Stream_Seek(response->data, (size_t)status);
+
+		if (!Stream_EnsureRemainingCapacity(response->data, 1024))
+			goto out_error;
+
+		position = Stream_GetPosition(response->data);
+
+		if (position < 4)
+			continue;
+		else if (position > RESPONSE_SIZE_LIMIT)
+		{
+			WLog_ERR(TAG, "Request header too large! (%" PRIdz " bytes) Aborting!", bodyLength);
+			goto out_error;
+		}
+
+		/* Always check at most the lase 8 bytes for occurance of the desired
+		 * sequence of \r\n\r\n */
+		s = (position > 8) ? 8 : position;
+		end = (char*)Stream_Pointer(response->data) - s;
+
+		if (string_strnstr(end, "\r\n\r\n", s) != NULL)
+			payloadOffset = Stream_GetPosition(response->data);
+	}
+
+out_error:
+	return payloadOffset;
+}
+
+static SSIZE_T http_response_transport_recv_line(rdpTransport* transport, HttpResponse* response)
+{
+	WINPR_ASSERT(transport);
+	WINPR_ASSERT(response);
+
+	SSIZE_T payloadOffset = -1;
+	while (payloadOffset <= 0)
+	{
+		size_t bodyLength = 0;
+		size_t position = 0;
+		int status = -1;
+		size_t s = 0;
+		char* end = NULL;
+		/* Read until we encounter \r\n\r\n */
+
+		status = transport_read_bytes(transport, Stream_Pointer(response->data), 1);
+		if (status <= 0)
+			goto out_error;
 
 #ifdef FREERDP_HAVE_VALGRIND_MEMCHECK_H
 		VALGRIND_MAKE_MEM_DEFINED(Stream_Pointer(response->data), status);
@@ -1410,6 +1564,88 @@ out_error:
 	return rc;
 }
 
+static BOOL http_response_transport_recv_body(rdpTransport* transport, HttpResponse* response,
+                                              BOOL readContentLength, size_t payloadOffset,
+                                              size_t bodyLength)
+{
+	BOOL rc = FALSE;
+
+	WINPR_ASSERT(transport);
+	WINPR_ASSERT(response);
+
+	if ((response->TransferEncoding == TransferEncodingChunked) && readContentLength)
+	{
+		http_encoding_chunked_context ctx = { 0 };
+		ctx.state = ChunkStateLenghHeader;
+		ctx.nextOffset = 0;
+		ctx.headerFooterPos = 0;
+		int full_len = 0;
+		do
+		{
+			if (!Stream_EnsureRemainingCapacity(response->data, 2048))
+				goto out_error;
+
+			int status = http_transport_chuncked_read(
+			    transport, response->data, Stream_GetRemainingCapacity(response->data), &ctx);
+			if (status == 0)
+				continue;
+			if (status < 0)
+				goto out_error;
+			else
+				full_len += status;
+		} while (ctx.state != ChunkStateEnd);
+		response->BodyLength = full_len;
+		if (response->BodyLength > 0)
+			response->BodyContent = &(Stream_Buffer(response->data))[payloadOffset];
+	}
+	else
+	{
+		while (response->BodyLength < bodyLength)
+		{
+			int status = 0;
+
+			if (!Stream_EnsureRemainingCapacity(response->data, bodyLength - response->BodyLength))
+				goto out_error;
+
+			status = transport_read_bytes(transport, Stream_Pointer(response->data),
+			                              bodyLength - response->BodyLength);
+			if (status <= 0)
+				goto out_error;
+
+			Stream_Seek(response->data, (size_t)status);
+			response->BodyLength += (unsigned long)status;
+
+			if (response->BodyLength > RESPONSE_SIZE_LIMIT)
+			{
+				WLog_ERR(TAG, "Request body too large! (%" PRIdz " bytes) Aborting!",
+				         response->BodyLength);
+				goto out_error;
+			}
+		}
+
+		if (response->BodyLength > 0)
+			response->BodyContent = &(Stream_Buffer(response->data))[payloadOffset];
+
+		if (bodyLength != response->BodyLength)
+		{
+			WLog_WARN(TAG, "%s unexpected body length: actual: %" PRIuz ", expected: %" PRIuz,
+			          response->ContentType, response->BodyLength, bodyLength);
+
+			if (bodyLength > 0)
+				response->BodyLength = MIN(bodyLength, response->BodyLength);
+		}
+
+		/* '\0' terminate the http body */
+		if (!Stream_EnsureRemainingCapacity(response->data, sizeof(UINT16)))
+			goto out_error;
+		Stream_Write_UINT16(response->data, 0);
+	}
+
+	rc = TRUE;
+out_error:
+	return rc;
+}
+
 HttpResponse* http_response_recv(rdpTls* tls, BOOL readContentLength)
 {
 	size_t bodyLength = 0;
@@ -1496,6 +1732,108 @@ HttpResponse* http_response_recv(rdpTls* tls, BOOL readContentLength)
 
 		/* Fetch remaining body! */
 		if (!http_response_recv_body(tls, response, readContentLength, payloadOffset, bodyLength))
+			goto out_error;
+	}
+	Stream_SealLength(response->data);
+
+	/* Ensure '\0' terminated string */
+	if (!Stream_EnsureRemainingCapacity(response->data, 2))
+		goto out_error;
+	Stream_Write_UINT16(response->data, 0);
+
+	return response;
+out_error:
+	http_response_free(response);
+	return NULL;
+}
+
+HttpResponse* http_response_transport_recv(rdpTransport* transport, BOOL readContentLength)
+{
+	size_t bodyLength = 0;
+	HttpResponse* response = http_response_new();
+
+	if (!response)
+		return NULL;
+
+	response->ContentLength = 0;
+
+	const SSIZE_T payloadOffset = http_response_transport_recv_line(transport, response);
+	if (payloadOffset < 0)
+		goto out_error;
+
+	if (payloadOffset)
+	{
+		size_t count = 0;
+		char* buffer = (char*)Stream_Buffer(response->data);
+		char* line = (char*)Stream_Buffer(response->data);
+		char* context = NULL;
+
+		while ((line = string_strnstr(line, "\r\n", payloadOffset - (line - buffer) - 2UL)))
+		{
+			line += 2;
+			count++;
+		}
+
+		response->count = count;
+
+		if (count)
+		{
+			response->lines = (char**)calloc(response->count, sizeof(char*));
+
+			if (!response->lines)
+				goto out_error;
+		}
+
+		buffer[payloadOffset - 1] = '\0';
+		buffer[payloadOffset - 2] = '\0';
+		count = 0;
+		line = strtok_s(buffer, "\r\n", &context);
+
+		while (line && (response->count > count))
+		{
+			response->lines[count] = line;
+			line = strtok_s(NULL, "\r\n", &context);
+			count++;
+		}
+
+		if (!http_response_parse_header(response))
+			goto out_error;
+
+		response->BodyLength = Stream_GetPosition(response->data) - payloadOffset;
+
+		WINPR_ASSERT(response->BodyLength == 0);
+		bodyLength = response->BodyLength; /* expected body length */
+
+		if (readContentLength)
+		{
+			const char* cur = response->ContentType;
+
+			while (cur != NULL)
+			{
+				if (http_use_content_length(cur))
+				{
+					if (response->ContentLength < RESPONSE_SIZE_LIMIT)
+						bodyLength = response->ContentLength;
+
+					break;
+				}
+				else
+					readContentLength = FALSE; /* prevent chunked read */
+
+				cur = strchr(cur, ';');
+			}
+		}
+
+		if (bodyLength > RESPONSE_SIZE_LIMIT)
+		{
+			WLog_ERR(TAG, "Expected request body too large! (%" PRIdz " bytes) Aborting!",
+			         bodyLength);
+			goto out_error;
+		}
+
+		/* Fetch remaining body! */
+		if (!http_response_transport_recv_body(transport, response, readContentLength,
+		                                       payloadOffset, bodyLength))
 			goto out_error;
 	}
 	Stream_SealLength(response->data);

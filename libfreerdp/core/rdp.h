@@ -264,6 +264,8 @@ FREERDP_LOCAL BOOL rdp_set_io_callbacks(rdpRdp* rdp, const rdpTransportIo* io_ca
 FREERDP_LOCAL BOOL rdp_set_io_callback_context(rdpRdp* rdp, void* usercontext);
 FREERDP_LOCAL void* rdp_get_io_callback_context(rdpRdp* rdp);
 
+FREERDP_LOCAL rdpTransport* rdp_transport_new(rdpRdp* rdp);
+
 #define RDP_TAG FREERDP_TAG("core.rdp")
 #ifdef WITH_DEBUG_RDP
 #define DEBUG_RDP(rdp, ...) WLog_Print(rdp->log, WLOG_DEBUG, __VA_ARGS__)

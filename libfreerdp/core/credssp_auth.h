@@ -37,7 +37,7 @@ WINPR_ATTR_MALLOC(credssp_auth_free, 1)
 FREERDP_LOCAL rdpCredsspAuth* credssp_auth_new(const rdpContext* context);
 
 FREERDP_LOCAL BOOL credssp_auth_init(rdpCredsspAuth* auth, TCHAR* pkg_name,
-                                     SecPkgContext_Bindings* bindings);
+                                     const SecPkgContext_Bindings* bindings);
 FREERDP_LOCAL BOOL credssp_auth_setup_client(rdpCredsspAuth* auth, const char* target_service,
                                              const char* target_hostname,
                                              const SEC_WINNT_AUTH_IDENTITY* identity,
