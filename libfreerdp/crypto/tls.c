@@ -726,7 +726,7 @@ static void SSLCTX_keylog_cb(const SSL* ssl, const char* line)
 	}
 }
 
-static void tls_reset(rdpTls* tls)
+void freerdp_tls_reset(rdpTls* tls)
 {
 	WINPR_ASSERT(tls);
 
@@ -762,7 +762,7 @@ static BOOL tls_prepare(rdpTls* tls, BIO* underlying, SSL_METHOD* method, int op
 	rdpSettings* settings = tls->context->settings;
 	WINPR_ASSERT(settings);
 
-	tls_reset(tls);
+	freerdp_tls_reset(tls);
 	tls->ctx = SSL_CTX_new(method);
 
 	tls->underlying = underlying;
@@ -1900,7 +1900,7 @@ void freerdp_tls_free(rdpTls* tls)
 	if (!tls)
 		return;
 
-	tls_reset(tls);
+	freerdp_tls_reset(tls);
 
 	if (tls->certificate_store)
 	{

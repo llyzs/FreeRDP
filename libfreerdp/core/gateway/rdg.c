@@ -1460,9 +1460,7 @@ static BOOL rdg_establish_data_connection(rdpRdg* rdg, rdpTls* tls, const char* 
 				 */
 				if (http_context_is_websocket_upgrade_enabled(rdg->http))
 				{
-					int fd = BIO_get_fd(tls->bio, NULL);
-					if (fd >= 0)
-						closesocket((SOCKET)fd);
+					freerdp_tls_reset(tls);
 					http_context_enable_websocket_upgrade(rdg->http, FALSE);
 					return rdg_establish_data_connection(rdg, tls, method, peerAddress, timeout,
 					                                     rpcFallback);
